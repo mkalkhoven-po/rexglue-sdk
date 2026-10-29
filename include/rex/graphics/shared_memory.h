@@ -11,7 +11,9 @@
  */
 
 #include <cstdint>
+#include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -33,6 +35,8 @@ class SharedMemory {
   virtual void ClearCache();
   void SetSystemPageBlocksValidWithGpuDataWritten();
   void InvalidateAllPages();
+  // Call when a frame ends (for hot page detection).
+  void AdvanceHotPageFrame() { ++hot_page_frame_; }
 
   typedef void (*GlobalWatchCallback)(const std::unique_lock<std::recursive_mutex>& global_lock,
                                       void* context, uint32_t address_first, uint32_t address_last,
@@ -129,6 +133,16 @@ class SharedMemory {
   // Mark the memory range as updated and protect it.
   void MakeRangeValid(uint32_t start, uint32_t length, bool written_by_gpu);
 
+  // Hot pages: pages the CPU rewrites every frame (such as dynamic vertex
+  // data) are not write-protected. Instead, whenever they are requested, they
+  // are compared with a shadow copy of what was uploaded last, and uploaded
+  // again only if changed. This saves a protection change for each upload and
+  // an access violation for each CPU write to them. Implementations enable
+  // this if their UploadRanges copies the data with CopyPagesForUpload.
+  void EnableHotPages();
+  // Copies pages to be uploaded to dst, hot pages from their shadow copies.
+  void CopyPagesForUpload(uint8_t* dst, uint32_t page_first, uint32_t page_count) const;
+
   // Uploads a range of host pages - only called if host GPU sparse memory
   // allocation succeeded if needed. While uploading, MakeRangeValid must be
   // called for each successfully uploaded range as early as possible, before
@@ -169,6 +183,31 @@ class SharedMemory {
   // ***************************************************************************
   // Things below should be fully protected by global_critical_region.
   // ***************************************************************************
+
+  // Hot pages (see EnableHotPages). Pages are uploaded in consecutive frames
+  // before becoming hot, and stop being hot when unchanged for a while, when
+  // watched, or when written by the GPU.
+  static constexpr uint8_t kHotPageUploadStreak = 3;
+  static constexpr uint32_t kHotPageUnchangedFrames = 120;
+  static constexpr uint32_t kMaxHotPages = 16384;
+  bool hot_pages_enabled_ = false;
+  uint32_t hot_page_frame_ = 1;
+  std::vector<uint64_t> hot_pages_;
+  uint32_t hot_page_count_ = 0;
+  std::vector<uint32_t> page_last_upload_frame_;
+  std::vector<uint32_t> page_last_change_frame_;
+  std::vector<uint8_t> page_upload_streak_;
+  std::unordered_map<uint32_t, std::unique_ptr<uint8_t[]>> hot_page_shadows_;
+  std::vector<std::pair<uint32_t, uint32_t>> hot_page_upload_ranges_;
+  bool IsPageHot(uint32_t page) const {
+    return hot_pages_enabled_ && ((hot_pages_[page >> 6] >> (page & 63)) & 1);
+  }
+  // The functions below must be called in the global critical region.
+  bool IsPageWatched(uint32_t page) const;
+  void DemoteHotPages(uint32_t page_first, uint32_t page_last);
+  // Compares requested hot pages with their shadow copies, dropping unchanged
+  // ones from upload_ranges_, and makes pages hot.
+  void FilterHotPageUploads(const std::unique_lock<std::recursive_mutex>& global_lock);
 
   // Pages whose contents in the buffer are in sync with guest memory.
   std::vector<uint64_t> system_page_flags_valid_;

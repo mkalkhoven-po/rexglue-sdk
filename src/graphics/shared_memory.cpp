@@ -15,10 +15,16 @@
 
 #include <rex/assert.h>
 #include <rex/bit.h>
+#include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/graphics/shared_memory.h>
 #include <rex/math.h>
 #include <rex/memory.h>
+
+REXCVAR_DEFINE_BOOL(shared_memory_hot_pages, true, "GPU",
+                    "Don't write-protect pages the CPU rewrites every frame; compare them with "
+                    "the last uploaded data when requested instead")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::graphics {
 
@@ -87,10 +93,150 @@ void SharedMemory::ShutdownCommon() {
   system_page_flags_valid_and_gpu_written_.clear();
   system_page_flags_valid_and_gpu_written_.shrink_to_fit();
   num_system_page_flags_ = 0;
+
+  hot_pages_enabled_ = false;
+  hot_pages_.clear();
+  hot_pages_.shrink_to_fit();
+  hot_page_count_ = 0;
+  page_last_upload_frame_.clear();
+  page_last_upload_frame_.shrink_to_fit();
+  page_last_change_frame_.clear();
+  page_last_change_frame_.shrink_to_fit();
+  page_upload_streak_.clear();
+  page_upload_streak_.shrink_to_fit();
+  hot_page_shadows_.clear();
+}
+
+void SharedMemory::EnableHotPages() {
+  if (!REXCVAR_GET(shared_memory_hot_pages)) {
+    return;
+  }
+  uint32_t page_count = kBufferSize >> page_size_log2_;
+  hot_pages_.assign(num_system_page_flags_, 0);
+  page_last_upload_frame_.assign(page_count, 0);
+  page_last_change_frame_.assign(page_count, 0);
+  page_upload_streak_.assign(page_count, 0);
+  hot_pages_enabled_ = true;
+}
+
+void SharedMemory::CopyPagesForUpload(uint8_t* dst, uint32_t page_first,
+                                      uint32_t page_count) const {
+  const uint32_t page_size = uint32_t(1) << page_size_log2_;
+  uint32_t run_first = page_first;
+  auto copy_run = [&](uint32_t run_end) {
+    if (run_end > run_first) {
+      std::memcpy(dst + ((run_first - page_first) << page_size_log2_),
+                  memory_.TranslatePhysical(run_first << page_size_log2_),
+                  (run_end - run_first) << page_size_log2_);
+    }
+  };
+  for (uint32_t page = page_first; page < page_first + page_count; ++page) {
+    if (!IsPageHot(page)) {
+      continue;
+    }
+    copy_run(page);
+    auto it = hot_page_shadows_.find(page);
+    assert_true(it != hot_page_shadows_.end());
+    std::memcpy(dst + ((page - page_first) << page_size_log2_), it->second.get(), page_size);
+    run_first = page + 1;
+  }
+  copy_run(page_first + page_count);
+}
+
+bool SharedMemory::IsPageWatched(uint32_t page) const {
+  WatchNode* node = watch_buckets_[page << page_size_log2_ >> kWatchBucketSizeLog2];
+  for (; node != nullptr; node = node->bucket_node_next) {
+    if (page >= node->range->page_first && page <= node->range->page_last) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void SharedMemory::DemoteHotPages(uint32_t page_first, uint32_t page_last) {
+  if (!hot_pages_enabled_ || !hot_page_count_) {
+    return;
+  }
+  for (uint32_t page = page_first; page <= page_last; ++page) {
+    uint64_t& block = hot_pages_[page >> 6];
+    uint64_t bit = uint64_t(1) << (page & 63);
+    if (!(block & bit)) {
+      continue;
+    }
+    block &= ~bit;
+    --hot_page_count_;
+    hot_page_shadows_.erase(page);
+    page_upload_streak_[page] = 0;
+    // Not valid (hot pages never are), so uploaded and protected again when
+    // requested next time; protect it now already, so writes before that are
+    // seen by watches.
+    memory().EnablePhysicalMemoryAccessCallbacks(page << page_size_log2_,
+                                                 uint32_t(1) << page_size_log2_, true, false);
+  }
+}
+
+void SharedMemory::FilterHotPageUploads(const std::unique_lock<std::recursive_mutex>& global_lock) {
+  const uint32_t page_size = uint32_t(1) << page_size_log2_;
+  hot_page_upload_ranges_.clear();
+  auto include = [this](uint32_t page) {
+    if (!hot_page_upload_ranges_.empty()) {
+      std::pair<uint32_t, uint32_t>& last = hot_page_upload_ranges_.back();
+      if (last.first + last.second == page) {
+        ++last.second;
+        return;
+      }
+    }
+    hot_page_upload_ranges_.emplace_back(page, 1);
+  };
+  for (const std::pair<uint32_t, uint32_t>& range : upload_ranges_) {
+    for (uint32_t page = range.first; page < range.first + range.second; ++page) {
+      const uint8_t* guest = memory_.TranslatePhysical(page << page_size_log2_);
+      if (IsPageHot(page)) {
+        uint8_t* shadow = hot_page_shadows_[page].get();
+        if (std::memcmp(guest, shadow, page_size) == 0) {
+          if (hot_page_frame_ - page_last_change_frame_[page] > kHotPageUnchangedFrames) {
+            // Static now - upload and protect it like other pages.
+            DemoteHotPages(page, page);
+            include(page);
+          }
+          continue;
+        }
+        std::memcpy(shadow, guest, page_size);
+        page_last_change_frame_[page] = hot_page_frame_;
+        // Not seen by an access violation, so notify the global watches here.
+        for (const auto global_watch : global_watches_) {
+          global_watch->callback(global_lock, global_watch->callback_context,
+                                 page << page_size_log2_, (page << page_size_log2_) + page_size - 1,
+                                 false);
+        }
+        include(page);
+        continue;
+      }
+      uint32_t last_upload_frame = page_last_upload_frame_[page];
+      if (last_upload_frame != hot_page_frame_) {
+        uint8_t& streak = page_upload_streak_[page];
+        streak = last_upload_frame + 1 == hot_page_frame_ ? std::min(streak + 1, 255) : 1;
+        page_last_upload_frame_[page] = hot_page_frame_;
+        if (streak >= kHotPageUploadStreak && hot_page_count_ < kMaxHotPages &&
+            !((system_page_flags_valid_and_gpu_written_[page >> 6] >> (page & 63)) & 1) &&
+            !IsPageWatched(page)) {
+          auto shadow = std::make_unique<uint8_t[]>(page_size);
+          std::memcpy(shadow.get(), guest, page_size);
+          hot_page_shadows_[page] = std::move(shadow);
+          hot_pages_[page >> 6] |= uint64_t(1) << (page & 63);
+          ++hot_page_count_;
+          page_last_change_frame_[page] = hot_page_frame_;
+        }
+      }
+      include(page);
+    }
+  }
+  upload_ranges_.swap(hot_page_upload_ranges_);
 }
 
 void SharedMemory::InvalidateAllPages() {
   auto global_lock = global_critical_region_.Acquire();
+  DemoteHotPages(0, (kBufferSize >> page_size_log2_) - 1);
 
   std::fill(system_page_flags_valid_.begin(), system_page_flags_valid_.end(), uint64_t(0));
   std::fill(system_page_flags_valid_and_gpu_written_.begin(),
@@ -167,6 +313,8 @@ SharedMemory::WatchHandle SharedMemory::WatchMemoryRange(uint32_t start, uint32_
   uint32_t bucket_last = watch_page_last << page_size_log2_ >> kWatchBucketSizeLog2;
 
   auto global_lock = global_critical_region_.Acquire();
+
+  DemoteHotPages(watch_page_first, watch_page_last);
 
   // Allocate the range.
   WatchRange* range = watch_range_first_free_;
@@ -263,6 +411,11 @@ void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length) {
   uint32_t page_first = start >> page_size_log2_;
   uint32_t page_last = end >> page_size_log2_;
 
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    DemoteHotPages(page_first, page_last);
+  }
+
   // Trigger modification callbacks so, for instance, resolved data is loaded to
   // the texture.
   FireWatches(page_first, page_last, true);
@@ -291,6 +444,7 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
   uint32_t valid_block_first = valid_page_first >> 6;
   uint32_t valid_block_last = valid_page_last >> 6;
 
+  bool any_hot = false;
   {
     auto global_lock = global_critical_region_.Acquire();
 
@@ -302,6 +456,10 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
       if (i == valid_block_last && (valid_page_last & 63) != 63) {
         valid_bits &= (uint64_t(1) << ((valid_page_last & 63) + 1)) - 1;
       }
+      if (hot_pages_enabled_ && !written_by_gpu && (hot_pages_[i] & valid_bits)) {
+        valid_bits &= ~hot_pages_[i];
+        any_hot = true;
+      }
       system_page_flags_valid_[i] |= valid_bits;
       uint64_t& gpu_written = system_page_flags_valid_and_gpu_written_[i];
       gpu_written = written_by_gpu ? (gpu_written | valid_bits) : (gpu_written & ~valid_bits);
@@ -309,9 +467,24 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
   }
 
   if (memory_invalidation_callback_handle_) {
-    memory().EnablePhysicalMemoryAccessCallbacks(
-        valid_page_first << page_size_log2_,
-        (valid_page_last - valid_page_first + 1) << page_size_log2_, true, false);
+    if (!any_hot) {
+      memory().EnablePhysicalMemoryAccessCallbacks(
+          valid_page_first << page_size_log2_,
+          (valid_page_last - valid_page_first + 1) << page_size_log2_, true, false);
+    } else {
+      // Protect only the runs of pages that are not hot.
+      uint32_t run_first = UINT32_MAX;
+      for (uint32_t page = valid_page_first; page <= valid_page_last + 1; ++page) {
+        bool protect = page <= valid_page_last && !IsPageHot(page);
+        if (protect && run_first == UINT32_MAX) {
+          run_first = page;
+        } else if (!protect && run_first != UINT32_MAX) {
+          memory().EnablePhysicalMemoryAccessCallbacks(
+              run_first << page_size_log2_, (page - run_first) << page_size_log2_, true, false);
+          run_first = UINT32_MAX;
+        }
+      }
+    }
   }
 }
 
@@ -452,6 +625,9 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
       if (range_start != UINT32_MAX) {
         append_upload_range(range_start, page_last + 1 - range_start);
       }
+    }
+    if (hot_pages_enabled_ && !upload_ranges_.empty()) {
+      FilterHotPageUploads(global_lock);
     }
   }
 

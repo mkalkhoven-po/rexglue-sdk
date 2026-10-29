@@ -42,6 +42,7 @@ VulkanSharedMemory::~VulkanSharedMemory() {
 
 bool VulkanSharedMemory::Initialize() {
   InitializeCommon();
+  EnableHotPages();
 
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -301,9 +302,8 @@ bool VulkanSharedMemory::UploadRanges(
         break;
       }
       MakeRangeValid(upload_range_start << page_size_log2(), uint32_t(upload_buffer_size), false);
-      std::memcpy(upload_buffer_mapping,
-                  memory().TranslatePhysical(upload_range_start << page_size_log2()),
-                  upload_buffer_size);
+      CopyPagesForUpload(upload_buffer_mapping, upload_range_start,
+                         uint32_t(upload_buffer_size >> page_size_log2()));
       if (upload_buffer_previous != upload_buffer && !upload_regions_.empty()) {
         assert_true(upload_buffer_previous != VK_NULL_HANDLE);
         command_buffer.CmdVkCopyBuffer(upload_buffer_previous, buffer_,

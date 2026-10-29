@@ -5448,6 +5448,9 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     if (REXCVAR_GET(clear_memory_page_state) && shared_memory_) {
       shared_memory_->SetSystemPageBlocksValidWithGpuDataWritten();
     }
+    if (shared_memory_) {
+      shared_memory_->AdvanceHotPageFrame();
+    }
     frame_open_ = false;
     // Submission already closed now, so minus 1.
     closed_frame_submissions_[(frame_current_++) % kMaxFramesInFlight] = GetCurrentSubmission() - 1;
