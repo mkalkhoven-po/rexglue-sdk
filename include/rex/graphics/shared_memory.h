@@ -36,7 +36,7 @@ class SharedMemory {
   void SetSystemPageBlocksValidWithGpuDataWritten();
   void InvalidateAllPages();
   // Call when a frame ends (for hot page detection).
-  void AdvanceHotPageFrame() { ++hot_page_frame_; }
+  void AdvanceHotPageFrame();
 
   typedef void (*GlobalWatchCallback)(const std::unique_lock<std::recursive_mutex>& global_lock,
                                       void* context, uint32_t address_first, uint32_t address_last,
@@ -185,15 +185,22 @@ class SharedMemory {
   // ***************************************************************************
 
   // Hot pages (see EnableHotPages). Pages are uploaded in consecutive frames
-  // before becoming hot, and stop being hot when unchanged for a while, when
-  // watched, or when written by the GPU.
+  // before becoming hot, and stop being hot when unchanged or not requested for
+  // a while, when watched, or when written by the GPU. The hot page state is
+  // only changed on the GPU thread (requests, frame ends, watches, GPU writes);
+  // changes that affect protection or watches are made in the global critical
+  // region, reads on the GPU thread may happen outside of it.
   static constexpr uint8_t kHotPageUploadStreak = 3;
   static constexpr uint32_t kHotPageUnchangedFrames = 120;
-  static constexpr uint32_t kMaxHotPages = 16384;
+  // Checked every this many frames for hot pages that are no longer requested.
+  static constexpr uint32_t kHotPageSweepFrames = 64;
+  // Memory for shadow copies.
+  static constexpr uint32_t kMaxHotPageBytes = 64 * 1024 * 1024;
   bool hot_pages_enabled_ = false;
   uint32_t hot_page_frame_ = 1;
   std::vector<uint64_t> hot_pages_;
   uint32_t hot_page_count_ = 0;
+  // For hot pages, the last frame they were requested in.
   std::vector<uint32_t> page_last_upload_frame_;
   std::vector<uint32_t> page_last_change_frame_;
   std::vector<uint8_t> page_upload_streak_;

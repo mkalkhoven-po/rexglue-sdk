@@ -21,9 +21,9 @@
 #include <rex/math.h>
 #include <rex/memory.h>
 
-REXCVAR_DEFINE_BOOL(shared_memory_hot_pages, true, "GPU",
+REXCVAR_DEFINE_BOOL(shared_memory_hot_pages, false, "GPU",
                     "Don't write-protect pages the CPU rewrites every frame; compare them with "
-                    "the last uploaded data when requested instead")
+                    "the last uploaded data when requested instead (Vulkan)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::graphics {
@@ -119,6 +119,25 @@ void SharedMemory::EnableHotPages() {
   hot_pages_enabled_ = true;
 }
 
+void SharedMemory::AdvanceHotPageFrame() {
+  ++hot_page_frame_;
+  if (!hot_page_count_ || (hot_page_frame_ % kHotPageSweepFrames)) {
+    return;
+  }
+  // Hot pages are only compared (and demoted when static) when requested, so
+  // demote the ones that are no longer requested here.
+  auto global_lock = global_critical_region_.Acquire();
+  std::vector<uint32_t> stale_pages;
+  for (const auto& [page, shadow] : hot_page_shadows_) {
+    if (hot_page_frame_ - page_last_upload_frame_[page] > kHotPageUnchangedFrames) {
+      stale_pages.push_back(page);
+    }
+  }
+  for (uint32_t page : stale_pages) {
+    DemoteHotPages(page, page);
+  }
+}
+
 void SharedMemory::CopyPagesForUpload(uint8_t* dst, uint32_t page_first,
                                       uint32_t page_count) const {
   const uint32_t page_size = uint32_t(1) << page_size_log2_;
@@ -157,22 +176,34 @@ void SharedMemory::DemoteHotPages(uint32_t page_first, uint32_t page_last) {
   if (!hot_pages_enabled_ || !hot_page_count_) {
     return;
   }
-  for (uint32_t page = page_first; page <= page_last; ++page) {
+  // Demoted pages are not valid (hot pages never are), so they are uploaded and
+  // protected again when requested next time; protect them now already, so
+  // writes before that are seen by watches. One call per run of pages.
+  uint32_t run_first = UINT32_MAX;
+  auto protect_run = [&](uint32_t run_end) {
+    if (run_first != UINT32_MAX) {
+      memory().EnablePhysicalMemoryAccessCallbacks(
+          run_first << page_size_log2_, (run_end - run_first) << page_size_log2_, true, false);
+      run_first = UINT32_MAX;
+    }
+  };
+  uint32_t page = page_first;
+  for (; page <= page_last && hot_page_count_; ++page) {
     uint64_t& block = hot_pages_[page >> 6];
     uint64_t bit = uint64_t(1) << (page & 63);
     if (!(block & bit)) {
+      protect_run(page);
       continue;
     }
     block &= ~bit;
     --hot_page_count_;
     hot_page_shadows_.erase(page);
     page_upload_streak_[page] = 0;
-    // Not valid (hot pages never are), so uploaded and protected again when
-    // requested next time; protect it now already, so writes before that are
-    // seen by watches.
-    memory().EnablePhysicalMemoryAccessCallbacks(page << page_size_log2_,
-                                                 uint32_t(1) << page_size_log2_, true, false);
+    if (run_first == UINT32_MAX) {
+      run_first = page;
+    }
   }
+  protect_run(page);
 }
 
 void SharedMemory::FilterHotPageUploads(const std::unique_lock<std::recursive_mutex>& global_lock) {
@@ -192,6 +223,7 @@ void SharedMemory::FilterHotPageUploads(const std::unique_lock<std::recursive_mu
     for (uint32_t page = range.first; page < range.first + range.second; ++page) {
       const uint8_t* guest = memory_.TranslatePhysical(page << page_size_log2_);
       if (IsPageHot(page)) {
+        page_last_upload_frame_[page] = hot_page_frame_;
         uint8_t* shadow = hot_page_shadows_[page].get();
         if (std::memcmp(guest, shadow, page_size) == 0) {
           if (hot_page_frame_ - page_last_change_frame_[page] > kHotPageUnchangedFrames) {
@@ -217,7 +249,8 @@ void SharedMemory::FilterHotPageUploads(const std::unique_lock<std::recursive_mu
         uint8_t& streak = page_upload_streak_[page];
         streak = last_upload_frame + 1 == hot_page_frame_ ? std::min(streak + 1, 255) : 1;
         page_last_upload_frame_[page] = hot_page_frame_;
-        if (streak >= kHotPageUploadStreak && hot_page_count_ < kMaxHotPages &&
+        if (streak >= kHotPageUploadStreak &&
+            hot_page_count_ < (kMaxHotPageBytes >> page_size_log2_) &&
             !((system_page_flags_valid_and_gpu_written_[page >> 6] >> (page & 63)) & 1) &&
             !IsPageWatched(page)) {
           auto shadow = std::make_unique<uint8_t[]>(page_size);
