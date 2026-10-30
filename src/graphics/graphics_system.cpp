@@ -35,6 +35,12 @@ REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, 
     .allowed({"none", "fxaa", "fxaa_extreme"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_DOUBLE(guest_vblank_rate, 0.0, "GPU",
+                      "Guest vblank rate in Hz (0 = refresh rate of the guest video mode). Games "
+                      "that present on vblank are capped to this rate; e.g. 30 for a 30 fps cap.")
+    .range(0.0, 1000.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
                     "Store shaders persistently and load them when loading games to avoid "
                     "runtime spikes and freezes when playing the game not for the first time.");
@@ -154,12 +160,16 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
         kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
         double refresh_rate_hz = std::max(1.0, double(float(video_mode.refresh_rate)));
         uint64_t guest_tick_frequency = chrono::Clock::guest_tick_frequency();
-        uint64_t vsync_interval_ticks =
-            std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
         uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
         while (vsync_worker_running_) {
           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
+          double vblank_rate_hz = REXCVAR_GET(guest_vblank_rate);
+          if (vblank_rate_hz <= 0.0) {
+            vblank_rate_hz = refresh_rate_hz;
+          }
+          uint64_t vsync_interval_ticks =
+              std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / vblank_rate_hz));
           uint64_t interval_ticks =
               REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
           while (current_time - last_frame_time >= interval_ticks) {
