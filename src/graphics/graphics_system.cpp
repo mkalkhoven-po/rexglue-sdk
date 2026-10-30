@@ -36,8 +36,10 @@ REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, 
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_DOUBLE(guest_vblank_rate, 0.0, "GPU",
-                      "Guest vblank rate in Hz (0 = refresh rate of the guest video mode). Games "
-                      "that present on vblank are capped to this rate; e.g. 30 for a 30 fps cap.")
+                      "Guest vblank rate in Hz (0 = video_mode_refresh_rate). Unlike "
+                      "video_mode_refresh_rate it doesn't change the refresh rate reported to the "
+                      "game, so games that present on vblank are capped to this rate (e.g. 30). "
+                      "Ignored when vsync is off.")
     .range(0.0, 1000.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
@@ -152,7 +154,7 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
                                  reinterpret_cast<runtime::MMIOReadCallback>(ReadRegisterThunk),
                                  reinterpret_cast<runtime::MMIOWriteCallback>(WriteRegisterThunk));
 
-  // Guest vblank timer based on the configured guest video mode.
+  // Guest vblank timer based on guest_vblank_rate or the guest video mode.
   vsync_worker_running_ = true;
   vsync_worker_thread_ = system::object_ref<system::XHostThread>(
       new system::XHostThread(kernel_state_, 128 * 1024, 0, [this]() {
@@ -162,16 +164,24 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
         uint64_t guest_tick_frequency = chrono::Clock::guest_tick_frequency();
         uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
+        uint64_t last_interval_ticks = 0;
         while (vsync_worker_running_) {
           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
+          // The range isn't enforced for command line values, and NaN passes it.
           double vblank_rate_hz = REXCVAR_GET(guest_vblank_rate);
-          if (vblank_rate_hz <= 0.0) {
-            vblank_rate_hz = refresh_rate_hz;
-          }
+          vblank_rate_hz =
+              vblank_rate_hz > 0.0 ? std::clamp(vblank_rate_hz, 1.0, 1000.0) : refresh_rate_hz;
           uint64_t vsync_interval_ticks =
               std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / vblank_rate_hz));
           uint64_t interval_ticks =
               REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
+          if (interval_ticks != last_interval_ticks) {
+            // Don't catch up on the old interval in a burst of vblanks at the new rate.
+            if (last_interval_ticks && current_time - last_frame_time > interval_ticks) {
+              last_frame_time = current_time - interval_ticks;
+            }
+            last_interval_ticks = interval_ticks;
+          }
           while (current_time - last_frame_time >= interval_ticks) {
             MarkVblank();
             last_frame_time += interval_ticks;
