@@ -12,6 +12,7 @@
 #pragma once
 
 #include <unordered_set>
+#include <vector>
 
 #include <rex/codegen/codegen_context.h>
 
@@ -35,7 +36,12 @@ inline std::unordered_set<uint32_t> buildKnownFunctions(const FunctionGraph& gra
 }
 
 /// Discover blocks for all pending functions.
+/// @param attempted If given, functions in it are skipped and the ones tried are added, so a
+///        function that fails discovery is only tried (and warned about) once.
+/// @param tried If given, the functions tried are appended to it.
 size_t discoverPendingFunctions(CodegenContext& ctx,
-                                const std::unordered_set<uint32_t>& knownFunctions);
+                                const std::unordered_set<uint32_t>& knownFunctions,
+                                std::unordered_set<uint32_t>* attempted = nullptr,
+                                std::vector<uint32_t>* tried = nullptr);
 
 }  // namespace rex::codegen

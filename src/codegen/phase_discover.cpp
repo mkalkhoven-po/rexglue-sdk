@@ -406,16 +406,20 @@ void functionPointerScan(CodegenContext& ctx) {
 
 /// Discover blocks for all pending functions (shared helper, declared in phase_helpers.h).
 size_t discoverPendingFunctions(CodegenContext& ctx,
-                                const std::unordered_set<uint32_t>& knownFunctions) {
+                                const std::unordered_set<uint32_t>& knownFunctions,
+                                std::unordered_set<uint32_t>* attempted,
+                                std::vector<uint32_t>* tried) {
   std::vector<uint32_t> pending;
   for (const auto& [addr, node] : ctx.graph.functions()) {
-    if (node->canDiscover()) {
+    if (node->canDiscover() && (!attempted || attempted->insert(addr).second)) {
       pending.push_back(addr);
     }
   }
   for (uint32_t funcAddr : pending) {
     discoverFunction(ctx, funcAddr, knownFunctions);
   }
+  if (tried)
+    tried->insert(tried->end(), pending.begin(), pending.end());
   return pending.size();
 }
 

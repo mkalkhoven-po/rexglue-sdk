@@ -150,11 +150,11 @@ size_t gapFillCodeRegions(CodegenContext& ctx, std::unordered_set<uint32_t>& att
       uint32_t start = segment.start;
       bool afterImport = false;
       while (start < segment.end) {
-        const FunctionNode* owner = graph.isEntryPoint(start) ? graph.functions().at(start).get()
+        const FunctionNode* owner = graph.isEntryPoint(start) ? graph.getFunction(start)
                                                               : graph.getFunctionContaining(start);
         if (owner) {
-          // The declared size is only trusted for CONFIG/PDATA (mirrors
-          // FunctionNode::containsAddress); otherwise only discovered blocks count.
+          // The declared size is only trusted for CONFIG/PDATA (as in
+          // FunctionNode::containsAddress); otherwise skip to the end of the last block.
           uint32_t ownerEnd = owner->end();
           if (owner->authority() != FunctionAuthority::CONFIG &&
               owner->authority() != FunctionAuthority::PDATA && !owner->blocks().empty()) {
@@ -181,7 +181,8 @@ size_t gapFillCodeRegions(CodegenContext& ctx, std::unordered_set<uint32_t>& att
       if (start >= segment.end || !attempted.insert(start).second)
         continue;
 
-      // Unused slots in the import thunk table are not code worth recompiling.
+      // Imports are registered with a size of 4, so the rest of an import thunk table
+      // (the following thunks and unused slots) would show up here; it isn't code.
       if (afterImport)
         continue;
 
@@ -219,8 +220,9 @@ size_t gapFillCodeRegions(CodegenContext& ctx, std::unordered_set<uint32_t>& att
 // Cleanup absorbed GAP_FILL functions
 //=============================================================================
 
-// Checks every GAP_FILL function, or only `candidates` when given (later GapFill
-// passes, where all older gap functions were already checked).
+// Checks every GAP_FILL function, or, when `candidates` is given (later GapFill passes,
+// where all older gap functions were already checked), only the gap functions among the
+// candidates and those that start inside a candidate's blocks.
 void cleanupAbsorbedGapFills(CodegenContext& ctx,
                              const std::vector<uint32_t>* candidates = nullptr) {
   auto& graph = ctx.graph;
@@ -229,7 +231,7 @@ void cleanupAbsorbedGapFills(CodegenContext& ctx,
   std::vector<uint32_t> gapAddrs;
   if (candidates) {
     gapAddrs = *candidates;
-    // A new gap function's blocks may also run over older gap functions that
+    // A newly discovered function's blocks may run over older gap functions that
     // follow it; those must be checked too.
     for (uint32_t addr : *candidates) {
       auto it = graph.functions().find(addr);
@@ -292,20 +294,29 @@ VoidResult GapFill(CodegenContext& ctx, ProgressReporter* reporter) {
   // pass skips past the blocks discovered in the previous one.
   constexpr int kMaxPasses = 1024;
   std::unordered_set<uint32_t> attempted;
-  for (int pass = 0; pass < kMaxPasses; ++pass) {
+  std::unordered_set<uint32_t> discoverAttempted;
+  int pass = 0;
+  for (; pass < kMaxPasses; ++pass) {
     std::vector<uint32_t> createdAddrs;
     size_t created = gapFillCodeRegions(ctx, attempted, createdAddrs);
     if (created == 0)
       break;
 
-    // Discover blocks for gap-filled functions
-    auto known = buildKnownFunctions(ctx.graph, /*excludeGapFill=*/true);
-    size_t discovered = discoverPendingFunctions(ctx, known);
+    // Discover blocks for the gap functions and for the call targets they register,
+    // so the next pass sees the real extent of every function. A function that fails
+    // discovery stays pending; it is tried only once.
+    std::vector<uint32_t> discoveredAddrs;
+    while (discoverPendingFunctions(ctx, buildKnownFunctions(ctx.graph, /*excludeGapFill=*/true),
+                                    &discoverAttempted, &discoveredAddrs) > 0) {}
     REXCODEGEN_DEBUG("Analyze: GapFill pass {}: {} gap functions, {} discovered", pass + 1, created,
-                     discovered);
+                     discoveredAddrs.size());
 
-    cleanupAbsorbedGapFills(ctx, pass == 0 ? nullptr : &createdAddrs);
+    // Any function discovered in this pass, not only a gap function, can absorb gap
+    // functions.
+    cleanupAbsorbedGapFills(ctx, pass == 0 ? nullptr : &discoveredAddrs);
   }
+  if (pass == kMaxPasses)
+    REXCODEGEN_WARN("Analyze: GapFill stopped after {} passes without converging", kMaxPasses);
 
   return Ok();
 }
