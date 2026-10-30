@@ -21,6 +21,8 @@
 #include "codegen_logging.h"
 #include <rex/memory/utils.h>
 
+#include <algorithm>
+
 #include <ppc.h>
 
 using rex::codegen::ppc::decode_instruction;
@@ -119,7 +121,8 @@ bool looksLikeExceptionData(const BinaryView& binary, const FunctionGraph& graph
   return false;
 }
 
-void gapFillCodeRegions(CodegenContext& ctx) {
+size_t gapFillCodeRegions(CodegenContext& ctx, std::unordered_set<uint32_t>& attempted,
+                          std::vector<uint32_t>& created) {
   REXCODEGEN_TRACE("Analyze: checking for uncovered code regions...");
 
   auto& graph = ctx.graph;
@@ -140,24 +143,63 @@ void gapFillCodeRegions(CodegenContext& ctx) {
     auto segments = splitRegionOnTerminators(region, binary, knownCallables);
 
     for (const auto& segment : segments) {
-      // Skip if this segment's start is already a registered function entry
-      if (graph.isEntryPoint(segment.start))
+      // A segment only ends at blr or a direct tail call, so it can begin with one or
+      // more known functions (e.g. ones ending in an indirect bctr tail call) and still
+      // hold uncovered code after them. Skip past the known functions instead of
+      // discarding the whole segment.
+      uint32_t start = segment.start;
+      bool afterImport = false;
+      while (start < segment.end) {
+        const FunctionNode* owner = graph.isEntryPoint(start) ? graph.functions().at(start).get()
+                                                              : graph.getFunctionContaining(start);
+        if (owner) {
+          // The declared size is only trusted for CONFIG/PDATA (mirrors
+          // FunctionNode::containsAddress); otherwise only discovered blocks count.
+          uint32_t ownerEnd = owner->end();
+          if (owner->authority() != FunctionAuthority::CONFIG &&
+              owner->authority() != FunctionAuthority::PDATA && !owner->blocks().empty()) {
+            ownerEnd = 0;
+            for (const auto& block : owner->blocks())
+              ownerEnd = std::max(ownerEnd, block.end());
+          }
+          if (ownerEnd > start) {
+            afterImport = owner->authority() == FunctionAuthority::IMPORT;
+            start = ownerEnd;
+            continue;
+          }
+        }
+        // Skip short null padding between functions
+        const uint8_t* data = binary.translate(start);
+        if (data && load_and_swap<uint32_t>(data) == 0) {
+          start += 4;
+          continue;
+        }
+        break;
+      }
+      // Only try each gap start once, so absorbed gap functions are not re-created
+      // on every pass.
+      if (start >= segment.end || !attempted.insert(start).second)
         continue;
 
-      // Skip if this segment's start is inside another function
-      if (auto* containingFunc = graph.getFunctionContaining(segment.start)) {
+      // Unused slots in the import thunk table are not code worth recompiling.
+      if (afterImport)
         continue;
-      }
+
+      // Stop at the next known function entry
+      uint32_t end = start + 4;
+      while (end < segment.end && !graph.isEntryPoint(end))
+        end += 4;
 
       // Skip if this looks like exception handler data (handler ptr + rdata ptr)
-      if (looksLikeExceptionData(binary, graph, segment.start))
+      if (looksLikeExceptionData(binary, graph, start))
         continue;
 
-      uint32_t segmentSize = segment.size();
-      graph.addFunction(segment.start, segmentSize, FunctionAuthority::GAP_FILL, false);
+      uint32_t segmentSize = end - start;
+      graph.addFunction(start, segmentSize, FunctionAuthority::GAP_FILL, false);
+      created.push_back(start);
 
-      REXCODEGEN_TRACE("GapFill: registered sub_{:08X} (0x{:08X}-0x{:08X}, {} bytes)",
-                       segment.start, segment.start, segment.end, segmentSize);
+      REXCODEGEN_TRACE("GapFill: registered sub_{:08X} (0x{:08X}-0x{:08X}, {} bytes)", start, start,
+                       end, segmentSize);
       segmentsCreated++;
     }
 
@@ -170,18 +212,45 @@ void gapFillCodeRegions(CodegenContext& ctx) {
   } else {
     REXCODEGEN_TRACE("Analyze: no uncovered regions found");
   }
+  return segmentsCreated;
 }
 
 //=============================================================================
 // Cleanup absorbed GAP_FILL functions
 //=============================================================================
 
-void cleanupAbsorbedGapFills(CodegenContext& ctx) {
+// Checks every GAP_FILL function, or only `candidates` when given (later GapFill
+// passes, where all older gap functions were already checked).
+void cleanupAbsorbedGapFills(CodegenContext& ctx,
+                             const std::vector<uint32_t>* candidates = nullptr) {
   auto& graph = ctx.graph;
   std::vector<uint32_t> toRemove;
 
-  for (const auto& [addr, node] : graph.functions()) {
-    if (node->authority() != FunctionAuthority::GAP_FILL)
+  std::vector<uint32_t> gapAddrs;
+  if (candidates) {
+    gapAddrs = *candidates;
+    // A new gap function's blocks may also run over older gap functions that
+    // follow it; those must be checked too.
+    for (uint32_t addr : *candidates) {
+      auto it = graph.functions().find(addr);
+      if (it == graph.functions().end())
+        continue;
+      uint32_t blockEnd = it->second->end();
+      for (const auto& block : it->second->blocks())
+        blockEnd = std::max(blockEnd, block.end());
+      for (uint32_t a = addr + 4; a < blockEnd; a += 4) {
+        if (graph.isEntryPoint(a))
+          gapAddrs.push_back(a);
+      }
+    }
+  } else {
+    for (const auto& [addr, node] : graph.functions())
+      gapAddrs.push_back(addr);
+  }
+
+  for (uint32_t addr : gapAddrs) {
+    auto it = graph.functions().find(addr);
+    if (it == graph.functions().end() || it->second->authority() != FunctionAuthority::GAP_FILL)
       continue;
 
     for (const auto& [otherAddr, otherNode] : graph.functions()) {
@@ -218,14 +287,25 @@ namespace phases {
 
 VoidResult GapFill(CodegenContext& ctx, ProgressReporter* reporter) {
   (void)reporter;
-  gapFillCodeRegions(ctx);
+  // A gap function's discovery can stop early (e.g. at an indirect bctr tail call),
+  // leaving the rest of its segment uncovered. Repeat until no new gaps appear; each
+  // pass skips past the blocks discovered in the previous one.
+  constexpr int kMaxPasses = 1024;
+  std::unordered_set<uint32_t> attempted;
+  for (int pass = 0; pass < kMaxPasses; ++pass) {
+    std::vector<uint32_t> createdAddrs;
+    size_t created = gapFillCodeRegions(ctx, attempted, createdAddrs);
+    if (created == 0)
+      break;
 
-  // Discover blocks for gap-filled functions
-  auto known = buildKnownFunctions(ctx.graph, /*excludeGapFill=*/true);
-  size_t discovered = discoverPendingFunctions(ctx, known);
-  REXCODEGEN_TRACE("Analyze: discovered blocks for {} gap-filled functions", discovered);
+    // Discover blocks for gap-filled functions
+    auto known = buildKnownFunctions(ctx.graph, /*excludeGapFill=*/true);
+    size_t discovered = discoverPendingFunctions(ctx, known);
+    REXCODEGEN_DEBUG("Analyze: GapFill pass {}: {} gap functions, {} discovered", pass + 1, created,
+                     discovered);
 
-  cleanupAbsorbedGapFills(ctx);
+    cleanupAbsorbedGapFills(ctx, pass == 0 ? nullptr : &createdAddrs);
+  }
 
   return Ok();
 }
